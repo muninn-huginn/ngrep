@@ -4,6 +4,10 @@ Drop-in `grep` replacement. Same interface, 5x–41x faster.
 
 Built from scratch in Rust. Uses SIMD-accelerated matching, memory-mapped I/O, and parallel directory walking. Works on ARM and x86.
 
+## Demo
+
+![ngrep demo](demo/ngrep-demo.gif)
+
 ## Benchmarks
 
 Single file, 39MB, 500K lines:
