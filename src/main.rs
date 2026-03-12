@@ -4,7 +4,7 @@ use std::io::{self, BufWriter, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use ignore::WalkBuilder;
 use memchr::memchr;
@@ -699,6 +699,167 @@ fn search_stdin(config: &Config) -> bool {
     found
 }
 
+// ── Streaming search+output (single pass, no Match allocation) ───────────────
+
+const BATCH_THRESHOLD: usize = 32 * 1024; // flush thread-local buffer at 32KB
+
+/// Batched output writer — accumulates output in a thread-local buffer,
+/// flushes to shared stdout at threshold or on Drop.
+struct BatchWriter {
+    buf: Vec<u8>,
+    stdout: Arc<Mutex<BufWriter<io::Stdout>>>,
+}
+
+impl BatchWriter {
+    fn new(stdout: Arc<Mutex<BufWriter<io::Stdout>>>) -> Self {
+        BatchWriter { buf: Vec::with_capacity(BATCH_THRESHOLD + 4096), stdout }
+    }
+
+    #[inline]
+    fn maybe_flush(&mut self) {
+        if self.buf.len() >= BATCH_THRESHOLD {
+            self.flush();
+        }
+    }
+
+    fn flush(&mut self) {
+        if !self.buf.is_empty() {
+            if let Ok(mut out) = self.stdout.lock() {
+                let _ = out.write_all(&self.buf);
+            }
+            self.buf.clear();
+        }
+    }
+}
+
+impl Drop for BatchWriter {
+    fn drop(&mut self) {
+        self.flush();
+    }
+}
+
+/// Get raw path bytes with "./" stripped, no heap allocation.
+#[inline]
+fn path_bytes(path: &Path) -> &[u8] {
+    #[cfg(unix)]
+    let raw: &[u8] = { use std::os::unix::ffi::OsStrExt; path.as_os_str().as_bytes() };
+    #[cfg(not(unix))]
+    let raw: &[u8] = path.to_string_lossy().as_bytes();
+    if raw.starts_with(b"./") { &raw[2..] } else { raw }
+}
+
+/// Write path prefix directly to buffer (no PathPrefix struct allocation).
+#[inline]
+fn write_path(buf: &mut Vec<u8>, path: &[u8], sep: u8, color: bool) {
+    if color {
+        buf.extend_from_slice(C_PATH);
+        buf.extend_from_slice(path);
+        buf.extend_from_slice(C_RESET);
+        buf.extend_from_slice(C_SEP);
+        buf.push(sep);
+        buf.extend_from_slice(C_RESET);
+    } else {
+        buf.extend_from_slice(path);
+        buf.push(sep);
+    }
+}
+
+/// Single-pass streaming search + output. No Match struct allocation.
+/// Returns true if any match found.
+#[inline]
+fn search_and_stream(
+    data: &[u8],
+    buf: &mut Vec<u8>,
+    path: &[u8],
+    show_path: bool,
+    config: &Config,
+) -> bool {
+    if data.is_empty() { return false; }
+
+    let mut found = false;
+    let mut search_from = 0;
+    let mut cur_line_num: usize = 1;
+    let mut counted_up_to: usize = 0;
+    let mut match_count: usize = 0;
+    let show_name = show_path && !config.no_filename;
+
+    while let Some(m) = config.pattern.find_at(data, search_from) {
+        found = true;
+
+        // Line boundaries
+        let line_start = match data[..m.start()].iter().rposition(|&b| b == b'\n') {
+            Some(p) => p + 1, None => 0,
+        };
+        let line_end = match memchr(b'\n', &data[m.start()..]) {
+            Some(p) => m.start() + p, None => data.len(),
+        };
+
+        // Line number
+        if line_start > counted_up_to {
+            cur_line_num += memchr::memchr_iter(b'\n', &data[counted_up_to..line_start]).count();
+        }
+        counted_up_to = line_start;
+
+        let line = &data[line_start..line_end];
+
+        // Write: [path:][linenum:]content\n
+        if show_name { write_path(buf, path, b':', config.color); }
+        if config.line_number { write_linenum(buf, cur_line_num, b':', config.color); }
+
+        if config.only_matching {
+            // Write each match on this line separately
+            for rm in config.pattern.find_iter(line) {
+                if config.color {
+                    buf.extend_from_slice(C_MATCH);
+                    buf.extend_from_slice(&line[rm.start()..rm.end()]);
+                    buf.extend_from_slice(C_RESET);
+                } else {
+                    buf.extend_from_slice(&line[rm.start()..rm.end()]);
+                }
+                buf.push(b'\n');
+                // Re-emit prefix for each subsequent match
+                match_count += 1;
+                if let Some(max) = config.max_count {
+                    if match_count >= max { return true; }
+                }
+            }
+            // Already handled count + newlines above, skip the common path below
+            if line_end >= data.len() { break; }
+            search_from = line_end + 1;
+            cur_line_num += 1;
+            counted_up_to = search_from;
+            continue;
+        }
+
+        if config.color {
+            // Highlight all matches on this line in one pass
+            let mut pos = 0;
+            for rm in config.pattern.find_iter(line) {
+                if rm.start() > pos { buf.extend_from_slice(&line[pos..rm.start()]); }
+                buf.extend_from_slice(C_MATCH);
+                buf.extend_from_slice(&line[rm.start()..rm.end()]);
+                buf.extend_from_slice(C_RESET);
+                pos = rm.end();
+            }
+            if pos < line.len() { buf.extend_from_slice(&line[pos..]); }
+        } else {
+            buf.extend_from_slice(line);
+        }
+        buf.push(b'\n');
+
+        match_count += 1;
+        if let Some(max) = config.max_count {
+            if match_count >= max { break; }
+        }
+        if line_end >= data.len() { break; }
+        search_from = line_end + 1;
+        cur_line_num += 1;
+        counted_up_to = search_from;
+    }
+
+    found
+}
+
 // ── Parallel file search ─────────────────────────────────────────────────────
 
 fn search_paths(config: &Config) -> bool {
@@ -706,7 +867,7 @@ fn search_paths(config: &Config) -> bool {
     let multi = config.paths.len() > 1
         || config.paths.iter().any(|p| p.is_dir())
         || config.force_filename;
-    let stdout = Mutex::new(BufWriter::with_capacity(STDOUT_BUF_SIZE, io::stdout()));
+    let stdout = Arc::new(Mutex::new(BufWriter::with_capacity(STDOUT_BUF_SIZE, io::stdout())));
 
     let mut builder = if config.paths.is_empty() {
         WalkBuilder::new(".")
@@ -737,13 +898,15 @@ fn search_paths(config: &Config) -> bool {
         if let Ok(ov) = ob.build() { builder.overrides(ov); }
     }
 
+    // Can we use the streaming fast path?
+    let use_streaming = !config.invert && !config.has_context && !config.count
+        && !config.files_only && !config.quiet;
+
     builder.build_parallel().run(|| {
         let config = &config;
         let found = &found;
-        let stdout = &stdout;
         let show_path = multi;
-        // Thread-local reusable output buffer
-        let mut buf = Vec::with_capacity(8192);
+        let mut bw = BatchWriter::new(stdout.clone());
 
         Box::new(move |entry| {
             let entry = match entry {
@@ -764,7 +927,9 @@ fn search_paths(config: &Config) -> bool {
                 return ignore::WalkState::Continue;
             }
 
-            // Fast paths that avoid full search
+            let pb = path_bytes(path);
+
+            // Fast paths
             if config.quiet {
                 if has_any_match(bytes, config) {
                     found.store(true, Ordering::Relaxed);
@@ -776,15 +941,15 @@ fn search_paths(config: &Config) -> bool {
             if config.files_only {
                 if has_any_match(bytes, config) {
                     found.store(true, Ordering::Relaxed);
-                    let prefix = PathPrefix::new(path);
-                    buf.clear();
                     if config.color {
-                        buf.extend_from_slice(&prefix.colored);
+                        bw.buf.extend_from_slice(C_PATH);
+                        bw.buf.extend_from_slice(pb);
+                        bw.buf.extend_from_slice(C_RESET);
                     } else {
-                        buf.extend_from_slice(&prefix.plain);
+                        bw.buf.extend_from_slice(pb);
                     }
-                    buf.push(b'\n');
-                    if let Ok(mut out) = stdout.lock() { let _ = out.write_all(&buf); }
+                    bw.buf.push(b'\n');
+                    bw.maybe_flush();
                 }
                 return ignore::WalkState::Continue;
             }
@@ -792,19 +957,26 @@ fn search_paths(config: &Config) -> bool {
             if config.count {
                 let c = count_matches(bytes, config);
                 if c > 0 { found.store(true, Ordering::Relaxed); }
-                buf.clear();
                 if show_path && !config.no_filename {
-                    let prefix = PathPrefix::new(path);
-                    prefix.write(&mut buf, b':', config.color);
+                    write_path(&mut bw.buf, pb, b':', config.color);
                 }
                 let mut itoa_buf = itoa::Buffer::new();
-                buf.extend_from_slice(itoa_buf.format(c).as_bytes());
-                buf.push(b'\n');
-                if let Ok(mut out) = stdout.lock() { let _ = out.write_all(&buf); }
+                bw.buf.extend_from_slice(itoa_buf.format(c).as_bytes());
+                bw.buf.push(b'\n');
+                bw.maybe_flush();
                 return ignore::WalkState::Continue;
             }
 
-            // Full search
+            // Streaming search+output (common case: no context, no invert)
+            if use_streaming {
+                if search_and_stream(bytes, &mut bw.buf, pb, show_path, config) {
+                    found.store(true, Ordering::Relaxed);
+                }
+                bw.maybe_flush();
+                return ignore::WalkState::Continue;
+            }
+
+            // Fallback: collect matches then format (context, invert modes)
             let matches = search_data(bytes, config);
             if matches.is_empty() {
                 return ignore::WalkState::Continue;
@@ -812,12 +984,8 @@ fn search_paths(config: &Config) -> bool {
             found.store(true, Ordering::Relaxed);
 
             let prefix = PathPrefix::new(path);
-            buf.clear();
-            format_results(&mut buf, bytes, &matches, Some(&prefix), config, show_path);
-
-            if let Ok(mut out) = stdout.lock() {
-                let _ = out.write_all(&buf);
-            }
+            format_results(&mut bw.buf, bytes, &matches, Some(&prefix), config, show_path);
+            bw.maybe_flush();
 
             ignore::WalkState::Continue
         })
