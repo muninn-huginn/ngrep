@@ -8,14 +8,12 @@ use std::sync::{Arc, Mutex};
 
 use ignore::WalkBuilder;
 use memchr::memchr;
-use memmap2::Mmap;
+// memmap2 available for very large files if needed
 use regex::bytes::{Regex, RegexBuilder};
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
-const MMAP_THRESHOLD: u64 = 64 * 1024;
-const BINARY_CHECK_LEN: usize = 8192;
-const STDOUT_BUF_SIZE: usize = 64 * 1024; // 64KB stdout buffer
+const STDOUT_BUF_SIZE: usize = 64 * 1024;
 
 const C_PATH: &[u8] = b"\x1b[35m";
 const C_LINE: &[u8] = b"\x1b[32m";
@@ -73,7 +71,7 @@ fn parse_args() -> Config {
     let mut only_matching = false;
     let mut quiet = false;
     let mut hidden = false;
-    let mut no_ignore = true; // grep default: search everything
+    let mut no_ignore = false; // respect .gitignore by default (like rg)
     let mut no_filename = false;
     let mut force_filename = false;
     let mut max_count: Option<usize> = None;
@@ -259,31 +257,18 @@ fn parse_args() -> Config {
 
 // ── File I/O ─────────────────────────────────────────────────────────────────
 
-enum FileData { Mmap(Mmap), Buf(Vec<u8>) }
-
-impl AsRef<[u8]> for FileData {
-    fn as_ref(&self) -> &[u8] {
-        match self { FileData::Mmap(m) => m, FileData::Buf(b) => b }
-    }
-}
-
+/// Read file into reusable buffer (zero alloc per file). Returns false on error/empty.
 #[inline]
-fn read_file(path: &Path) -> io::Result<FileData> {
-    let file = File::open(path)?;
-    let len = file.metadata()?.len();
-    if len == 0 { return Ok(FileData::Buf(Vec::new())); }
-    if len >= MMAP_THRESHOLD {
-        Ok(FileData::Mmap(unsafe { Mmap::map(&file)? }))
-    } else {
-        let mut buf = Vec::with_capacity(len as usize);
-        { let mut f = file; f.read_to_end(&mut buf)?; }
-        Ok(FileData::Buf(buf))
-    }
+fn read_file_into(path: &Path, buf: &mut Vec<u8>) -> bool {
+    buf.clear();
+    let Ok(mut file) = File::open(path) else { return false };
+    file.read_to_end(buf).is_ok() && !buf.is_empty()
 }
 
+/// Quick binary check — 512 bytes is enough (binaries have nulls early).
 #[inline]
 fn is_binary(data: &[u8]) -> bool {
-    memchr(0, &data[..data.len().min(BINARY_CHECK_LEN)]).is_some()
+    memchr(0, &data[..data.len().min(512)]).is_some()
 }
 
 // ── Search ───────────────────────────────────────────────────────────────────
@@ -907,6 +892,8 @@ fn search_paths(config: &Config) -> bool {
         let found = &found;
         let show_path = multi;
         let mut bw = BatchWriter::new(stdout.clone());
+        // Thread-local reusable file buffer — eliminates per-file allocation
+        let mut file_buf: Vec<u8> = Vec::with_capacity(256 * 1024);
 
         Box::new(move |entry| {
             let entry = match entry {
@@ -918,18 +905,18 @@ fn search_paths(config: &Config) -> bool {
             }
 
             let path = entry.path();
-            let data = match read_file(path) {
-                Ok(d) => d,
-                Err(_) => return ignore::WalkState::Continue,
-            };
-            let bytes = data.as_ref();
-            if bytes.is_empty() || is_binary(bytes) {
+
+            // Read into reusable buffer (1 syscall: open+read, no fstat)
+            if !read_file_into(path, &mut file_buf) {
+                return ignore::WalkState::Continue;
+            }
+            if is_binary(&file_buf) {
                 return ignore::WalkState::Continue;
             }
 
-            let pb = path_bytes(path);
+            let bytes = &file_buf[..];
 
-            // Fast paths
+            // Fast paths — defer path_bytes until match found
             if config.quiet {
                 if has_any_match(bytes, config) {
                     found.store(true, Ordering::Relaxed);
@@ -941,6 +928,7 @@ fn search_paths(config: &Config) -> bool {
             if config.files_only {
                 if has_any_match(bytes, config) {
                     found.store(true, Ordering::Relaxed);
+                    let pb = path_bytes(path);
                     if config.color {
                         bw.buf.extend_from_slice(C_PATH);
                         bw.buf.extend_from_slice(pb);
@@ -957,6 +945,7 @@ fn search_paths(config: &Config) -> bool {
             if config.count {
                 let c = count_matches(bytes, config);
                 if c > 0 { found.store(true, Ordering::Relaxed); }
+                let pb = path_bytes(path);
                 if show_path && !config.no_filename {
                     write_path(&mut bw.buf, pb, b':', config.color);
                 }
@@ -969,6 +958,7 @@ fn search_paths(config: &Config) -> bool {
 
             // Streaming search+output (common case: no context, no invert)
             if use_streaming {
+                let pb = path_bytes(path);
                 if search_and_stream(bytes, &mut bw.buf, pb, show_path, config) {
                     found.store(true, Ordering::Relaxed);
                 }
@@ -1028,7 +1018,8 @@ OPTIONS:
     -g GLOB         Glob filter
     -j NUM          Threads
     --hidden        Include hidden files
-    --gitignore     Respect .gitignore (off by default, like grep)
+    --no-ignore     Don't respect .gitignore
+    --gitignore     Respect .gitignore (on by default)
     --include=GLOB  Include glob (grep compat)
     --exclude=GLOB  Exclude glob (grep compat)
     --exclude-dir=D Exclude dir (grep compat)
