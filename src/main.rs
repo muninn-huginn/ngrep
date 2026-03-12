@@ -71,7 +71,7 @@ fn parse_args() -> Config {
     let mut only_matching = false;
     let mut quiet = false;
     let mut hidden = false;
-    let mut no_ignore = false; // respect .gitignore by default (like rg)
+    let mut no_ignore = true; // grep default: search everything
     let mut no_filename = false;
     let mut force_filename = false;
     let mut max_count: Option<usize> = None;
@@ -1018,8 +1018,8 @@ OPTIONS:
     -g GLOB         Glob filter
     -j NUM          Threads
     --hidden        Include hidden files
+    --gitignore     Respect .gitignore (off by default)
     --no-ignore     Don't respect .gitignore
-    --gitignore     Respect .gitignore (on by default)
     --include=GLOB  Include glob (grep compat)
     --exclude=GLOB  Exclude glob (grep compat)
     --exclude-dir=D Exclude dir (grep compat)
